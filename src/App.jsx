@@ -3,7 +3,7 @@ import {
   Plus, Sun, Moon, Trash2, Pencil, ChevronUp, ChevronDown, X, Check,
   ChevronDown as CaretDown, Image as ImageIcon, Link2, Settings2,
   ArrowUpDown, GripVertical, Copy, ExternalLink, Eye, ListOrdered, LayoutGrid, List as ListIcon, Languages, Loader2,
-  CheckSquare, Square, FileSpreadsheet, AlertTriangle
+  CheckSquare, Square, FileSpreadsheet, AlertTriangle, LogOut, User
 } from "lucide-react";
 import * as XLSX from "xlsx";
 
@@ -61,16 +61,36 @@ const compressImage = async (file) => {
   }
 };
 
-// 브라우저 localStorage 기반 저장소 (기기/브라우저별로 저장됨, 용량 제한 약 5~10MB)
+// 브라우저 localStorage 기반 저장소 (오프라인 캐시 + 최초 로딩용, 기기별로 저장됨)
 const store = {
   async get(k) { try { const v = window.localStorage.getItem(k); return v === null ? null : v; } catch { return null; } },
   async set(k, v) { try { window.localStorage.setItem(k, v); return true; } catch (e) { console.error("저장 실패", e); return false; } },
   async del(k) { try { window.localStorage.removeItem(k); } catch {} },
 };
 
-const DATA_KEY = "scrapboard-data";
+const NICK_KEY = "scrapboard-nickname"; // 이 기기에서 마지막으로 로그인한 닉네임 (자동완성용)
 const THEME_KEY = "scrapboard-theme";
-const IMG_KEY = (id) => "scrapimg-" + id;
+const dataKey = (nick) => "scrapboard-data:" + nick;
+
+/* ── 서버(닉네임 기반) 동기화 API ──
+   /api/scrap 는 Vercel 서버리스 함수로, Upstash Redis(REST API)에
+   닉네임별로 전체 데이터를 JSON 통째로 저장/조회합니다. */
+const remoteLoad = async (nickname) => {
+  const r = await fetch("/api/scrap?nickname=" + encodeURIComponent(nickname));
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j?.error || "서버에서 불러오지 못했어요");
+  return j.data; // null 이면 서버에 저장된 데이터 없음
+};
+const remoteSave = async (nickname, payload) => {
+  const r = await fetch("/api/scrap", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ nickname, data: payload }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j?.error || "서버에 저장하지 못했어요");
+  return j;
+};
 
 const DEFAULT_CATS = [
   { id: "cat-kitchen", name: "주방·레시피" },
@@ -149,7 +169,11 @@ const THEMES = {
 /* ───────────────────────── 메인 ───────────────────────── */
 
 export default function App() {
+  const [nickname, setNickname] = useState(null); // null = 로그인 전
+  const [checkingNick, setCheckingNick] = useState(true); // 자동로그인 시도 중
+
   const [loaded, setLoaded] = useState(false);
+  const [syncState, setSyncState] = useState("idle"); // idle | saving | saved | error | offline
   const [themeName, setThemeName] = useState("light");
   const T = THEMES[themeName];
 
@@ -202,38 +226,91 @@ export default function App() {
     return () => mq.removeEventListener("change", on);
   }, []);
 
-  /* ── 로드 ── */
+  /* ── 닉네임 자동 로그인 (이 기기에 저장된 닉네임이 있으면 바로 입장) ── */
   useEffect(() => {
     (async () => {
       const t = await store.get(THEME_KEY);
       if (t === "dark" || t === "light") setThemeName(t);
-      const raw = await store.get(DATA_KEY);
-      let d = null;
-      if (raw) { try { d = JSON.parse(raw); } catch {} }
-      const cats = d?.categories?.length ? d.categories : DEFAULT_CATS;
-      const ps = d?.posts || [];
-      const ord = d?.orders || { all: [] };
-      // 순서 정합성 보정
-      const fixed = fixOrders(ord, ps, cats);
-      setCategories(cats); setPosts(ps); setOrders(fixed);
-      // 이미지 로드
-      const entries = await Promise.all(
-        ps.map(async (p) => [p.id, await store.get(IMG_KEY(p.id))])
-      );
-      const map = {};
-      for (const [id, v] of entries) if (v) map[id] = v;
-      setImages(map);
-      setLoaded(true);
+      const saved = await store.get(NICK_KEY);
+      if (saved) setNickname(saved);
+      setCheckingNick(false);
     })();
   }, []);
 
-  /* ── 저장 ── */
+  /* ── 로드: 닉네임이 정해지면 로컬 캐시로 먼저 그리고, 서버 데이터로 갱신 ── */
   useEffect(() => {
-    if (!loaded) return;
-    store.set(DATA_KEY, JSON.stringify({ categories, posts, orders }));
-  }, [categories, posts, orders, loaded]);
+    if (!nickname) return;
+    let cancelled = false;
+    (async () => {
+      setLoaded(false);
+      // 1) 로컬 캐시(오프라인/최초 렌더용)
+      const raw = await store.get(dataKey(nickname));
+      let d = null;
+      if (raw) { try { d = JSON.parse(raw); } catch {} }
+      let cats = d?.categories?.length ? d.categories : DEFAULT_CATS;
+      let ps = d?.posts || [];
+      let ord = d?.orders || { all: [] };
+      let imgs = d?.images || {};
+      if (!cancelled) {
+        setCategories(cats); setPosts(ps); setOrders(fixOrders(ord, ps, cats)); setImages(imgs);
+        setLoaded(true);
+      }
+      // 2) 서버 데이터 확인 (다른 기기에서 저장한 최신 데이터를 가져옴)
+      try {
+        setSyncState("saving");
+        const remote = await remoteLoad(nickname);
+        if (cancelled) return;
+        if (remote) {
+          cats = remote.categories?.length ? remote.categories : DEFAULT_CATS;
+          ps = remote.posts || [];
+          ord = remote.orders || { all: [] };
+          imgs = remote.images || {};
+          setCategories(cats); setPosts(ps); setOrders(fixOrders(ord, ps, cats)); setImages(imgs);
+          await store.set(dataKey(nickname), JSON.stringify({ categories: cats, posts: ps, orders: ord, images: imgs }));
+        } else if (ps.length || cats !== DEFAULT_CATS) {
+          // 서버엔 없고 이 기기에만 데이터가 있던 경우 → 서버에 처음 업로드
+          await remoteSave(nickname, { categories: cats, posts: ps, orders: ord, images: imgs });
+        }
+        setSyncState("saved");
+      } catch (e) {
+        console.error(e);
+        if (!cancelled) setSyncState("offline");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [nickname]);
+
+  /* ── 저장: 로컬 캐시 + 서버 동기화 (디바운스) ── */
+  const saveTimer = useRef(null);
+  useEffect(() => {
+    if (!loaded || !nickname) return;
+    const payload = { categories, posts, orders, images };
+    store.set(dataKey(nickname), JSON.stringify(payload));
+    setSyncState("saving");
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      remoteSave(nickname, payload)
+        .then(() => setSyncState("saved"))
+        .catch((e) => { console.error(e); setSyncState("offline"); });
+    }, 800);
+    return () => clearTimeout(saveTimer.current);
+  }, [categories, posts, orders, images, loaded, nickname]);
 
   useEffect(() => { if (loaded) store.set(THEME_KEY, themeName); }, [themeName, loaded]);
+
+  /* ── 로그인 / 로그아웃 ── */
+  const login = async (nick) => {
+    const n = nick.trim();
+    if (!n) return;
+    await store.set(NICK_KEY, n);
+    setNickname(n);
+  };
+  const logout = async () => {
+    await store.del(NICK_KEY);
+    setNickname(null);
+    setLoaded(false);
+    setCategories(DEFAULT_CATS); setPosts([]); setOrders({ all: [] }); setImages({});
+  };
 
   function fixOrders(ord, ps, cats) {
     const next = {};
@@ -278,9 +355,8 @@ export default function App() {
     if (imageFile) {
       try {
         const data = await compressImage(imageFile);
+        // images는 categories/posts/orders와 함께 통째로 저장/동기화됨 (아래 저장 useEffect 참고)
         setImages((m) => ({ ...m, [id]: data }));
-        const ok = await store.set(IMG_KEY(id), data);
-        if (!ok) showToast("이미지 영구 저장에 실패했어요. 새로고침 시 사라질 수 있어요.");
       } catch (e) {
         showToast("이미지를 등록하지 못했어요: " + (e?.message || e));
       }
@@ -354,7 +430,6 @@ export default function App() {
       for (const id of ids) delete n[id];
       return n;
     });
-    for (const id of ids) store.del(IMG_KEY(id));
     setSelectedIds([]);
     if (set.has(sourcePostId)) setSourcePostId(null);
     if (set.has(editPostId)) setEditPostId(null);
@@ -380,8 +455,6 @@ export default function App() {
     try {
       const data = await compressImage(file);
       setImages((m) => ({ ...m, [id]: data }));
-      const ok = await store.set(IMG_KEY(id), data);
-      if (!ok) showToast("이미지 영구 저장에 실패했어요. 새로고침 시 사라질 수 있어요.");
     } catch (e) {
       showToast("이미지를 불러오지 못했어요: " + (e?.message || e));
     }
@@ -389,7 +462,6 @@ export default function App() {
 
   const removePostImage = (id) => {
     setImages((m) => { const n = { ...m }; delete n[id]; return n; });
-    store.del(IMG_KEY(id));
   };
 
   const requestImage = (postId) => {
@@ -506,10 +578,22 @@ export default function App() {
     color: T.text, outline: "none",
   };
 
-  if (!loaded) {
+  if (checkingNick) {
     return (
       <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: THEMES.light.bg, color: THEMES.light.sub, fontFamily: "system-ui" }}>
         불러오는 중…
+      </div>
+    );
+  }
+
+  if (!nickname) {
+    return <LoginScreen T={T} btn={btn} inputStyle={inputStyle} onLogin={login} />;
+  }
+
+  if (!loaded) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: THEMES.light.bg, color: THEMES.light.sub, fontFamily: "system-ui" }}>
+        {nickname}님의 데이터를 불러오는 중…
       </div>
     );
   }
@@ -607,8 +691,16 @@ export default function App() {
         )}
           </>
         )}
+        <span style={{ fontSize: 11.5, color: syncState === "offline" ? T.danger : T.faint, whiteSpace: "nowrap" }} title={nickname + "님으로 로그인됨"}>
+          {syncState === "saving" && "동기화 중…"}
+          {syncState === "saved" && "저장됨"}
+          {syncState === "offline" && "오프라인 (이 기기에만 저장됨)"}
+        </span>
         <button onClick={() => setThemeName((t) => (t === "light" ? "dark" : "light"))} style={iconBtn} title="라이트/다크 전환">
           {themeName === "light" ? <Moon size={15} /> : <Sun size={15} />}
+        </button>
+        <button onClick={logout} style={iconBtn} title={`${nickname}님으로 로그인됨 · 눌러서 다른 닉네임으로 전환`}>
+          <LogOut size={15} />
         </button>
       </div>
     </header>
@@ -896,6 +988,62 @@ export default function App() {
           {toast}
         </div>
       )}
+    </div>
+  );
+}
+
+/* ───────────────────────── 닉네임 로그인 ───────────────────────── */
+
+function LoginScreen({ T, btn, inputStyle, onLogin }) {
+  const [nick, setNick] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    const n = nick.trim();
+    if (!n) return;
+    setBusy(true);
+    try { await onLogin(n); } finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{
+      minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
+      background: T.bg, color: T.text, fontFamily: "system-ui", padding: 20,
+    }}>
+      <div style={{
+        width: "100%", maxWidth: 360, background: T.panel, border: `1px solid ${T.border}`,
+        borderRadius: 16, padding: 26, boxShadow: T.shadow,
+      }}>
+        <div style={{
+          width: 48, height: 48, borderRadius: "50%", margin: "0 auto 14px",
+          background: "linear-gradient(135deg,#feda75,#d62976,#4f5bd5)",
+          display: "flex", alignItems: "center", justifyContent: "center", color: "#fff",
+        }}>
+          <User size={22} />
+        </div>
+        <div style={{ fontSize: 17, fontWeight: 800, textAlign: "center", marginBottom: 6 }}>
+          숏폼 스크랩 보드
+        </div>
+        <div style={{ fontSize: 13, color: T.sub, textAlign: "center", marginBottom: 18, lineHeight: 1.5 }}>
+          닉네임을 입력하면 휴대폰·PC 등 어떤 기기에서든<br />같은 닉네임으로 동일한 데이터를 이용할 수 있어요.
+        </div>
+        <input
+          autoFocus
+          style={inputStyle}
+          value={nick}
+          onChange={(e) => setNick(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+          placeholder="닉네임 입력 (예: minji92)"
+          maxLength={40}
+        />
+        <button onClick={submit} disabled={busy || !nick.trim()}
+          style={{ ...btn(true), width: "100%", justifyContent: "center", marginTop: 10, opacity: busy || !nick.trim() ? 0.6 : 1 }}>
+          {busy ? "확인 중…" : "시작하기"}
+        </button>
+        <div style={{ fontSize: 11.5, color: T.faint, textAlign: "center", marginTop: 14, lineHeight: 1.5 }}>
+          ⚠️ 별도의 비밀번호는 없어요. 같은 닉네임을 아는 사람은<br />이 데이터를 보거나 바꿀 수 있으니, 남들이 잘 모를 닉네임을 써주세요.
+        </div>
+      </div>
     </div>
   );
 }
